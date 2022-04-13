@@ -50,6 +50,7 @@ import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.ShuffleForcedMergePolicy;
 import org.apache.lucene.index.SoftDeletesRetentionMergePolicy;
 import org.apache.lucene.index.StandardDirectoryReader;
+import org.apache.lucene.index.SoftDeletesDirectoryReaderWrapper;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.sandbox.index.MergeOnFlushMergePolicy;
 import org.apache.lucene.search.BooleanClause;
@@ -717,9 +718,11 @@ public class InternalEngine extends Engine {
     }
 
     private DirectoryReader getDirectoryReader() throws IOException {
-        // for segment replication: replicas should create the reader from store, we don't want an open IW on replicas.
+        // for segment replication: replicas should create the reader from store and, we don't want an open IW on replicas.
+        // We should always wrap the DirectoryReader used on replicas with SoftDeletesDirectoryReaderWrapper so that we filter out soft
+        // deletes
         if (engineConfig.isReadOnly()) {
-            return DirectoryReader.open(store.directory());
+            return new SoftDeletesDirectoryReaderWrapper(DirectoryReader.open(store.directory()), Lucene.SOFT_DELETES_FIELD);
         }
         return DirectoryReader.open(indexWriter);
     }
@@ -1525,8 +1528,7 @@ public class InternalEngine extends Engine {
                 }
             }
             if (delete.origin().isFromTranslog() == false && deleteResult.getResultType() == Result.Type.SUCCESS) {
-                final Translog.Location location = translog.add(new Translog.Delete(delete, deleteResult));
-                deleteResult.setTranslogLocation(location);
+                addDeleteOperationToTranslog(delete, deleteResult);
             }
             localCheckpointTracker.markSeqNoAsProcessed(deleteResult.getSeqNo());
             if (deleteResult.getTranslogLocation() == null) {
@@ -1548,6 +1550,30 @@ public class InternalEngine extends Engine {
         }
         maybePruneDeletes();
         return deleteResult;
+    }
+
+    @Override
+    public Engine.DeleteResult addDeleteOperationToTranslog(Delete delete) throws IOException {
+        try (Releasable ignored = versionMap.acquireLock(delete.uid().bytes())) {
+            DeletionStrategy plan = deletionStrategyForOperation(delete);
+            DeleteResult deleteResult = new DeleteResult(
+                plan.versionOfDeletion,
+                delete.primaryTerm(),
+                delete.seqNo(),
+                plan.currentlyDeleted == false
+            );
+            addDeleteOperationToTranslog(delete, deleteResult);
+            deleteResult.setTook(System.nanoTime() - delete.startTime());
+            deleteResult.freeze();
+            return deleteResult;
+        }
+    }
+
+    private void addDeleteOperationToTranslog(Delete delete, DeleteResult deleteResult) throws IOException {
+        if (deleteResult.getResultType() == Result.Type.SUCCESS) {
+            final Translog.Location location = translog.add(new Translog.Delete(delete, deleteResult));
+            deleteResult.setTranslogLocation(location);
+        }
     }
 
     private Exception tryAcquireInFlightDocs(Operation operation, int addingDocs) {
@@ -2287,6 +2313,12 @@ public class InternalEngine extends Engine {
         OpenSearchDirectoryReader reader = null;
         try {
             reader = externalReaderManager.internalReaderManager.acquire();
+            /* This is safe, as we always wrap Standard reader with a SoftDeletesDirectoryReaderWrapper for replicas when segment
+            replication is enabled */
+            if (engineConfig.isReadOnly()) {
+                return ((StandardDirectoryReader) ((SoftDeletesDirectoryReaderWrapper) reader.getDelegate()).getDelegate())
+                    .getSegmentInfos();
+            }
             return ((StandardDirectoryReader) reader.getDelegate()).getSegmentInfos();
         } catch (IOException e) {
             throw new EngineException(shardId, e.getMessage(), e);
